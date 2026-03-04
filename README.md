@@ -23,5 +23,23 @@ The goal is to flag uncertain predictions for human review, enhancing clinical d
 
 ## Status
 
-Phase 1 – Environment Setup Completed ✅  
-Next: MIT-BIH Data Acquisition and Exploration
+### Phase 1 – Environment Setup ✅
+- Python virtual environment
+- Required libraries installed
+- Project structure initialized
+
+### Phase 2 – Data Acquisition & Exploration ✅
+- MIT-BIH dataset downloaded
+- ECG records loaded successfully
+- Data exploration notebook created
+- ECG waveform visualization completed
+- Annotation distribution analyzed
+
+### Phase 3 – Preprocessing Pipeline 🔄 (Next)
+Planned components:
+
+- ECG bandpass filtering (0.5–40 Hz)
+- R-peak segmentation (heartbeat extraction)
+- 5-class arrhythmia mapping
+- Patient-wise dataset split
+- Dataset preparation for CNN training
