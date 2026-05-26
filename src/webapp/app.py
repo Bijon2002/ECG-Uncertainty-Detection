@@ -359,7 +359,8 @@ def render_model_info():
 # ─── Live Monitor Helpers ─────────────────────────────────────────────────────────
 def init_state():
     defaults = dict(monitoring=False, ecg_data=[], predictions=[],
-                    timestamps=[], uncertainties=[], confidences=[])
+                    timestamps=[], uncertainties=[], confidences=[],
+                    live_uncertainty=None)
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -376,22 +377,47 @@ def analyze_sample(ecg, uq):
         'probs':       probs,
     }
 
+def analyze_sample_with_uncertainty(ecg, uq, mc_samples=10):
+    inp = ecg.reshape(1, -1)
+    mc = uq.monte_carlo_dropout(inp, num_samples=mc_samples)
+    ent = uq.predictive_entropy(inp)
+    clus = uq.cluster_based_entropy(inp)
+    probs = ent['predictions'][0]
+    pred = int(np.argmax(probs))
+    result = {
+        'class': pred,
+        'confidence': float(probs[pred]),
+        'entropy': float(ent['entropy'][0]),
+        'probs': probs,
+    }
+    metrics = {
+        'mc': float(mc['epistemic_uncertainty'][0]),
+        'entropy': float(ent['entropy'][0]),
+        'cluster': float(clus['cluster_uncertainty'][0]),
+    }
+    return result, metrics
+
 def ecg_chart(ecg_data, window=1800):
     data = ecg_data[-window:] if len(ecg_data) > window else ecg_data
+    x = np.arange(len(data))
     fig  = go.Figure()
     fig.add_trace(go.Scatter(
-        y=data, mode='lines',
-        line=dict(color='#38bdf8', width=1.8),
-        fill='tozeroy', fillcolor='rgba(56,189,248,0.07)',
+        x=x, y=data, mode='lines',
+        line=dict(color='#0284c7', width=1.9),
+        fill='tozeroy', fillcolor='rgba(2,132,199,0.06)',
         hovertemplate='Sample: %{x}<br>Amp: %{y:.4f}<extra></extra>',
     ))
     fig.update_layout(
         **PLOTLY_THEME,
-        title=dict(text='🫀 Live ECG Stream', font_size=14),
+        title=dict(text='Live ECG Stream', font_size=14, x=0.01, xanchor='left'),
         xaxis_title='Sample', yaxis_title='Amplitude',
-        height=280, margin=dict(l=50, r=20, t=45, b=40),
-        showlegend=False,
+        height=320, margin=dict(l=46, r=18, t=44, b=38),
+        showlegend=False, hovermode='x unified',
+        uirevision='live-ecg-stable',
+        transition=dict(duration=250, easing='cubic-in-out'),
     )
+    fig.update_xaxes(range=[0, max(window - 1, 1)], fixedrange=True, zeroline=False)
+    fig.update_yaxes(range=[-4, 4], fixedrange=True, zeroline=True, zerolinecolor='rgba(100,116,139,0.28)')
     return fig
 
 def timeline_chart():
@@ -483,6 +509,63 @@ def render_kpis(analysis):
   </div>
 </div>""", unsafe_allow_html=True)
 
+def render_live_alert(result):
+    cls = result['class']
+    entropy = result['entropy']
+    confidence = result['confidence']
+    class_name = CLASS_NAMES[cls]
+
+    if cls in [2, 3] or entropy > 0.35:
+        alert_class = "toast-critical"
+        label = "Critical"
+        title = f"{class_name} detected"
+        detail = "High-risk rhythm or elevated uncertainty. Escalate for expert review."
+    elif cls != 0 or entropy > 0.2:
+        alert_class = "toast-warning"
+        label = "Caution"
+        title = f"{class_name} signal"
+        detail = "Model sees ambiguity. Correlate with clinical context before action."
+    else:
+        alert_class = "toast-success"
+        label = "Stable"
+        title = "Normal rhythm"
+        detail = "Current beat is low risk with acceptable model confidence."
+
+    st.markdown(f"""
+<div class="toastify-alert {alert_class}" role="status">
+  <div class="toast-main">
+    <div class="toast-icon"></div>
+    <div class="toast-copy">
+      <div class="toast-topline">
+        <span class="toast-severity">{label}</span>
+        <span class="toast-time">Live ECG</span>
+      </div>
+      <div class="toast-title">{title}</div>
+      <div class="toast-detail">{detail}</div>
+    </div>
+  </div>
+  <div class="toast-metrics">
+    <span>Entropy <b>{entropy:.3f}</b></span>
+    <span>Confidence <b>{confidence:.1%}</b></span>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+def render_live_uncertainty(metrics):
+    if not metrics:
+        return
+
+    cards = [
+        ("Monte Carlo Dropout", metrics['mc'], 'mc', "Epistemic uncertainty from stochastic inference."),
+        ("Predictive Entropy", metrics['entropy'], 'entropy', "Total prediction uncertainty from class probabilities."),
+        ("Cluster-based Entropy", metrics['cluster'], 'entropy', "Clinical grouping uncertainty across rhythm classes."),
+    ]
+
+    st.markdown('<div class="live-unc-title">Uncertainty Metrics</div>', unsafe_allow_html=True)
+    cols = st.columns(3)
+    for col, (title, value, method, tooltip) in zip(cols, cards):
+        with col:
+            unc_card(title, value, method, tooltip)
+
 # ─── Live Monitor Page ─────────────────────────────────────────────────────────────
 def render_live(models, datasets, uq, interval, window):
     init_state()
@@ -528,6 +611,92 @@ def render_live(models, datasets, uq, interval, window):
         st.toast("🔄 Live monitoring buffer cleared.", icon="🔄")
         st.rerun()
 
+    @st.fragment(run_every=interval if st.session_state.monitoring else None)
+    def live_monitor_panel():
+        if st.session_state.monitoring:
+            idx = int(np.random.randint(0, len(X_test)))
+            sample = X_test[idx]
+            st.session_state.ecg_data.extend(sample.tolist())
+
+            result, live_metrics = analyze_sample_with_uncertainty(sample, uq, mc_samples=10)
+            st.session_state.live_uncertainty = live_metrics
+            now = datetime.now()
+
+            st.session_state.predictions.append(result['class'])
+            st.session_state.timestamps.append(now)
+            st.session_state.uncertainties.append(result['entropy'])
+            st.session_state.confidences.append(result['confidence'])
+
+            for key in ['predictions', 'timestamps', 'uncertainties', 'confidences']:
+                if len(st.session_state[key]) > 50:
+                    st.session_state[key] = st.session_state[key][-50:]
+            if len(st.session_state.ecg_data) > 9000:
+                st.session_state.ecg_data = st.session_state.ecg_data[-9000:]
+
+            if result['class'] != 0 or result['entropy'] > 0.3:
+                alert_msg = f"{CLASS_NAMES[result['class']]} detected (Entropy: {result['entropy']:.3f})"
+                if st.session_state.get('last_live_alert') != alert_msg:
+                    st.session_state['last_live_alert'] = alert_msg
+                    if result['class'] in [2, 3] or result['entropy'] > 0.35:
+                        st.toast(f":red[🚨 **CRITICAL ALERT:** {CLASS_NAMES[result['class']]} beat detected! (Entropy: {result['entropy']:.3f})]")
+                    else:
+                        st.toast(f":orange[⚠️ **WARNING:** {CLASS_NAMES[result['class']]} beat detected. (Entropy: {result['entropy']:.3f})]")
+            elif st.session_state.get('last_live_alert') is not None:
+                st.session_state['last_live_alert'] = None
+                st.toast(":green[✅ **NORMAL RHYTHM:** Sinus rhythm restored with high confidence.]")
+        elif st.session_state.predictions:
+            result = {
+                'class': st.session_state.predictions[-1],
+                'confidence': st.session_state.confidences[-1],
+                'entropy': st.session_state.uncertainties[-1],
+            }
+        else:
+            result = {'class': 0, 'confidence': 0.0, 'entropy': 0.0}
+            st.session_state.live_uncertainty = None
+
+        label, pill_cls, dot_cls = get_status()
+        mon_label = "LIVE" if st.session_state.monitoring else "PAUSED"
+        mon_color = "#10b981" if st.session_state.monitoring else "#64748b"
+        st.markdown(f"""
+<div style="display:flex;align-items:center;gap:1rem;margin:0.6rem 0 0.2rem">
+  <span class="status-pill {pill_cls}">
+    <span class="status-dot {dot_cls}"></span>{label}
+  </span>
+  <span style="font-size:0.82rem;font-weight:700;color:{mon_color}">{mon_label}</span>
+</div>""", unsafe_allow_html=True)
+
+        render_kpis(result)
+
+        if st.session_state.ecg_data:
+            st.plotly_chart(ecg_chart(st.session_state.ecg_data, window), use_container_width=True)
+
+        render_live_alert(result)
+        render_live_uncertainty(st.session_state.get('live_uncertainty'))
+
+        fig_tl = timeline_chart()
+        fig_uh = uncertainty_history_chart()
+        c_left, c_right = st.columns(2)
+        if fig_tl:
+            c_left.plotly_chart(fig_tl, use_container_width=True)
+        if fig_uh:
+            c_right.plotly_chart(fig_uh, use_container_width=True)
+
+        if st.session_state.predictions:
+            n = min(15, len(st.session_state.predictions))
+            recent_df = pd.DataFrame({
+                'Time': [t.strftime('%H:%M:%S') for t in st.session_state.timestamps[-n:]],
+                'Prediction': [CLASS_NAMES[p] for p in st.session_state.predictions[-n:]],
+                'Confidence': [f"{c:.1%}" for c in st.session_state.confidences[-n:]],
+                'Entropy': [f"{u:.4f}" for u in st.session_state.uncertainties[-n:]],
+                'Risk': ['High' if u > 0.3 else ('Medium' if u > 0.15 else 'Low')
+                         for u in st.session_state.uncertainties[-n:]],
+            })
+            st.markdown("#### Recent Predictions")
+            st.dataframe(recent_df, use_container_width=True, hide_index=True)
+
+    live_monitor_panel()
+    return
+
     # ── Status indicator ─────────────────────────────────────────────────────────
     label, pill_cls, dot_cls = get_status()
     mon_label = "● LIVE" if st.session_state.monitoring else "● PAUSED"
@@ -550,7 +719,7 @@ def render_live(models, datasets, uq, interval, window):
     table_ph    = st.empty()
 
     # ── Render static state when paused ──────────────────────────────────────────
-    if st.session_state.ecg_data:
+    if st.session_state.ecg_data and not st.session_state.monitoring:
         with ecg_ph.container():
             st.plotly_chart(ecg_chart(st.session_state.ecg_data, window),
                             use_container_width=True)
@@ -561,7 +730,7 @@ def render_live(models, datasets, uq, interval, window):
         if fig_uh:
             uh_ph.plotly_chart(fig_uh, use_container_width=True)
 
-    if st.session_state.predictions:
+    if st.session_state.predictions and not st.session_state.monitoring:
         n = min(15, len(st.session_state.predictions))
         recent_df = pd.DataFrame({
             'Time':       [t.strftime('%H:%M:%S') for t in st.session_state.timestamps[-n:]],
@@ -608,14 +777,10 @@ def render_live(models, datasets, uq, interval, window):
                             use_container_width=True)
 
         # Alert
+        with alert_ph.container():
+            render_live_alert(result)
+
         if result['class'] != 0 or result['entropy'] > 0.3:
-            alert_ph.markdown(f"""
-<div class="alert-box">
-  🚨 <b>{CLASS_NAMES[result['class']]} detected</b> &nbsp;|&nbsp;
-  Entropy: {result['entropy']:.3f} &nbsp;|&nbsp;
-  Confidence: {result['confidence']:.1%} &nbsp;—&nbsp;
-  Consider expert review.
-</div>""", unsafe_allow_html=True)
             alert_msg = f"{CLASS_NAMES[result['class']]} detected (Entropy: {result['entropy']:.3f})"
             if st.session_state.get('last_live_alert') != alert_msg:
                 st.session_state['last_live_alert'] = alert_msg
@@ -624,7 +789,6 @@ def render_live(models, datasets, uq, interval, window):
                 else:
                     st.toast(f":orange[⚠️ **WARNING:** {CLASS_NAMES[result['class']]} beat detected. (Entropy: {result['entropy']:.3f})]")
         else:
-            alert_ph.empty()
             if st.session_state.get('last_live_alert') is not None:
                 st.session_state['last_live_alert'] = None
                 st.toast(":green[✅ **NORMAL RHYTHM:** Sinus rhythm restored with high confidence.]")
@@ -799,9 +963,10 @@ def main():
         background: var(--card-bg);
         border: 1px solid var(--card-border);
         box-shadow: var(--card-shadow);
-        border-radius: 1rem;
-        padding: 1.1rem 1.2rem;
+        border-radius: 0.75rem;
+        padding: 1rem 1.05rem;
         margin-bottom: 0.8rem;
+        min-height: 170px;
     }}
     .unc-card .unc-label {{
         font-size: 0.78rem;
@@ -815,6 +980,12 @@ def main():
         font-size: 1.5rem;
         font-weight: 800;
         margin-bottom: 0.5rem;
+    }}
+    .live-unc-title {{
+        margin: 1rem 0 0.45rem;
+        color: var(--text-color);
+        font-size: 1rem;
+        font-weight: 800;
     }}
     .unc-bar-bg {{
         background: var(--unc-bar-bg);
@@ -868,28 +1039,79 @@ def main():
     /* ── Live Monitor Specific ── */
     .status-pill {{
         display: inline-flex; align-items: center; gap: 8px;
-        padding: 0.4rem 1.1rem; border-radius: 999px;
+        min-height: 38px; padding: 0.42rem 1.05rem; border-radius: 999px;
         font-size: 0.85rem; font-weight: 700; letter-spacing: 0.04em;
-        transition: all 0.3s;
+        transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
     }}
     .status-live    {{ background: var(--badge-green-bg); color: var(--badge-green-text) !important; border: 1px solid var(--badge-green-border); }}
     .status-warning {{ background: var(--badge-yellow-bg); color: var(--badge-yellow-text) !important; border: 1px solid var(--badge-yellow-border); }}
     .status-alert   {{ background: var(--badge-red-bg); color: var(--badge-red-text) !important; border: 1px solid var(--badge-red-border); }}
+    .status-dot {{ width: 8px; height: 8px; border-radius: 999px; display:inline-block; flex:0 0 auto; }}
+    .dot-live {{ background:#10b981; box-shadow:0 0 0 4px rgba(16,185,129,0.12); }}
+    .dot-warning {{ background:#f59e0b; box-shadow:0 0 0 4px rgba(245,158,11,0.14); }}
+    .dot-alert {{ background:#ef4444; box-shadow:0 0 0 4px rgba(239,68,68,0.14); }}
     
-    .kpi-grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:0.8rem; margin:0.8rem 0; }}
+    .kpi-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:0.8rem; margin:0.9rem 0; }}
     .kpi {{
         background: var(--card-bg); border: 1px solid var(--card-border);
-        box-shadow: var(--card-shadow); border-radius: 0.9rem;
-        padding: 1rem 1.2rem; text-align: center; transition: all 0.3s;
+        box-shadow: var(--card-shadow); border-radius: 0.75rem;
+        min-height: 112px; padding: 1rem 1.05rem; text-align: center;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
     }}
+    .kpi:hover {{ border-color:#bfdbfe; box-shadow:0 10px 24px rgba(15,23,42,0.08); }}
     .kpi .kpi-label {{ font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; color: var(--card-label) !important; margin-bottom:0.35rem; }}
-    .kpi .kpi-value {{ font-size:1.7rem; font-weight:800; line-height:1.1; }}
+    .kpi .kpi-value {{ font-size:1.55rem; font-weight:800; line-height:1.15; overflow-wrap:anywhere; }}
     .kpi .kpi-sub   {{ font-size:0.78rem; color: var(--card-sub) !important; margin-top:0.2rem; }}
     
-    .alert-box {{
-        background: var(--rec-danger-bg); border: 1px solid var(--rec-danger-border);
-        border-left: 4px solid var(--rec-danger-border); color: var(--rec-danger-text) !important;
-        padding: 0.9rem 1.2rem; border-radius: 0.8rem; margin: 0.8rem 0; font-weight: 500; transition: all 0.3s;
+    .toastify-alert {{
+        position:relative; min-height:96px; display:flex; align-items:center; justify-content:space-between; gap:1rem;
+        overflow:hidden; border-radius:8px; padding:1rem 1.05rem 1rem 1.2rem; margin:0.95rem 0;
+        border:1px solid rgba(148,163,184,0.24); background:#ffffff;
+        box-shadow:0 14px 34px rgba(15,23,42,0.10), 0 3px 8px rgba(15,23,42,0.05);
+        animation:toastSlideIn 220ms ease-out;
+    }}
+    .toastify-alert::before {{
+        content:""; position:absolute; left:0; top:0; bottom:0; width:6px;
+    }}
+    .toast-main {{ display:flex; align-items:center; gap:0.85rem; min-width:0; }}
+    .toast-icon {{
+        width:34px; height:34px; border-radius:999px; flex:0 0 auto;
+        box-shadow:inset 0 0 0 7px rgba(255,255,255,0.48);
+    }}
+    .toast-copy {{ min-width:0; }}
+    .toast-topline {{ display:flex; align-items:center; gap:0.5rem; margin-bottom:0.18rem; }}
+    .toast-severity {{
+        border-radius:999px; padding:0.16rem 0.55rem; font-size:0.68rem; font-weight:900;
+        text-transform:uppercase; letter-spacing:0.08em;
+    }}
+    .toast-time {{ color:#64748b; font-size:0.72rem; font-weight:700; }}
+    .toast-title {{ color:#0f172a; font-size:1.02rem; font-weight:850; line-height:1.18; }}
+    .toast-detail {{ color:#475569; font-size:0.85rem; margin-top:0.22rem; line-height:1.35; }}
+    .toast-metrics {{ display:flex; gap:0.5rem; flex-wrap:wrap; justify-content:flex-end; flex:0 0 auto; }}
+    .toast-metrics span {{
+        white-space:nowrap; border-radius:999px; padding:0.34rem 0.68rem;
+        font-size:0.76rem; font-weight:800; background:#f8fafc; color:#334155; border:1px solid #e2e8f0;
+    }}
+    .toast-success::before {{ background:#16a34a; }}
+    .toast-success .toast-icon {{ background:#16a34a; }}
+    .toast-success .toast-severity {{ background:#dcfce7; color:#166534; }}
+    .toast-success {{ border-color:#bbf7d0; }}
+    .toast-warning::before {{ background:#f59e0b; }}
+    .toast-warning .toast-icon {{ background:#f59e0b; }}
+    .toast-warning .toast-severity {{ background:#fef3c7; color:#92400e; }}
+    .toast-warning {{ border-color:#fde68a; }}
+    .toast-critical::before {{ background:#dc2626; }}
+    .toast-critical .toast-icon {{ background:#dc2626; }}
+    .toast-critical .toast-severity {{ background:#fee2e2; color:#991b1b; }}
+    .toast-critical {{ border-color:#fecaca; }}
+    @keyframes toastSlideIn {{
+        from {{ opacity:0; transform:translateY(-6px); }}
+        to {{ opacity:1; transform:translateY(0); }}
+    }}
+    @media (max-width: 900px) {{
+        .kpi-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+        .toastify-alert {{ align-items:flex-start; flex-direction:column; }}
+        .toast-metrics {{ justify-content:flex-start; }}
     }}
     
     [data-testid="stExpander"] {{
@@ -946,29 +1168,9 @@ def main():
 
         X_test, y_test = datasets['test']
 
-        # Custom upload
-        with st.expander("📁 Upload Custom ECG (optional)", expanded=False):
-            up = st.file_uploader("Upload .npy or .csv with 180 ECG values", type=["npy","csv"])
-            if up:
-                try:
-                    if up.name.endswith(".npy"):
-                        arr = np.load(up).flatten()
-                    else:
-                        arr = pd.read_csv(up, header=None).values.flatten()
-                    arr = arr[:180].astype(np.float32)
-                    if len(arr) < 180:
-                        st.warning(f"Too short ({len(arr)} samples). Need 180.")
-                    else:
-                        st.session_state['custom_ecg'] = arr.reshape(1, -1)
-                        st.success("Custom ECG loaded — click **Analyze Custom ECG** below.")
-                except Exception as e:
-                    st.error(f"Load error: {e}")
-
-        b1, b2, b3 = st.columns(3)
+        b1, b2 = st.columns(2)
         run_rand = b1.button("🎲 Random Sample",    type="primary",    use_container_width=True)
         run_abn  = b2.button("🚨 Abnormal Sample",  type="secondary",  use_container_width=True)
-        run_cus  = b3.button("📁 Custom ECG",        use_container_width=True,
-                              disabled='custom_ecg' not in st.session_state)
 
         if run_rand:
             idx = int(np.random.randint(0, len(X_test)))
@@ -980,10 +1182,6 @@ def main():
             idx = int(np.random.choice(ab)) if len(ab) else int(np.random.randint(0, len(X_test)))
             st.session_state['result'] = (X_test[idx:idx+1], int(y_test[idx]), idx, True)
             st.toast(f"🚨 Selected Abnormal Arrhythmia Sample #{idx} (True Class: {CLASS_NAMES[int(y_test[idx])]}).", icon="🚨")
-
-        if run_cus and 'custom_ecg' in st.session_state:
-            st.session_state['result'] = (st.session_state['custom_ecg'], 0, "Custom", False)
-            st.toast("📁 Custom ECG uploaded signal selected for analysis.", icon="📁")
 
         if 'result' in st.session_state:
             ecg, lbl, idx, show_true = st.session_state['result']
