@@ -18,6 +18,7 @@ wfdb>=4.1.2
 neurokit2>=0.2.4
 
 # Web App
+streamlit>=1.32
 flask>=2.2
 
 # Utilities

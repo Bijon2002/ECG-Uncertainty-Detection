@@ -21,6 +21,15 @@ The goal is to flag uncertain predictions for human review, enhancing clinical d
 - `results/` – Evaluation outputs (ignored in Git)
 - `data/` – ECG datasets (ignored in Git)
 
+## Local environment (recommended)
+
+This repository uses a Python virtual environment for development. To keep the repository small and reproducible:
+
+- Create your virtual environment outside the repository root (for example `../ecg-venv`).
+- Ensure `/.venv/` or `venv/` is listed in `.gitignore` (already present).
+- Close VS Code and any running Python processes before moving or deleting the `.venv` folder on Windows to avoid file-lock errors.
+- See `docs/venv.md` for quick commands and guidance.
+
 ## Status
 
 ### Phase 1 – Environment Setup ✅
